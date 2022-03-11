@@ -1,0 +1,271 @@
+---
+title: "Social Tic - 2022"
+author: "Subdirección de Datos Abiertos - ADIP"
+date: "4/3/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(st,sf,rgeos,tidyverse,jsonlite,rgdal,leaflet,ggspatial,raster,htmltools)
+```
+
+## Objetivo General
+Description: This code aims to download the FGJ Victims Database using datos.cdmx.gob.mx, Mexico City's open data portal.
+Using districts provided by IECM: https://datos.cdmx.gob.mx/dataset/coloniascdmx 
+
+### Setup .-
+```{r setupp, eval=FALSE}
+dev.off()
+rm(list=ls())
+# install.packages(pacman) #Se utiliza para manejar paquetes de R
+pacman::p_load(st,sf,rgeos,tidyverse,jsonlite,rgdal,leaflet,ggspatial,raster,htmltools)
+```
+
+### Mapa IECM - 2019 .-
+
+Vamos a usar el mapa del IECM que se encuentra en https://datos.cdmx.gob.mx/dataset/coloniascdmx 
+
+```{r mapa_iecm}
+getwd()
+mapa_iecd <- readOGR("/Users/dortega/Desktop/ADIP/social tic//input/mgpc_2019.shp") #Cargamos el mapa de colonias del IEECM
+class(mapa_iecd)
+mapa_iecd@data %>% head()
+
+#Ver el Mapa
+plot(mapa_iecd, col="#f2f2f2", bg="skyblue", border="black" ,lwd=0.5 )
+```
+
+
+### Víctimas en Carpetas de Investigación de la CDMX .- 
+
+Consulta base de datos de víctimas de la fiscalía con la API; podemos encontrar aquí la documentacion de la API de CKAN: https://docs.ckan.org/en/2.9/api/
+
+Pero la construcción de una consulta requiere esencialmente de:
+
+* URL de consulta
+* función que se pide
+* id de Base de Datos que necesitamos
+
+En nuestro caso también añadiremos dos parámetros de consulta adicionales:
+
+* Límite
+* Offset
+
+```{r consulta_bdd}
+url <- "https://datos.cdmx.gob.mx/api/3/action/"
+funcion <- "datastore_search?resource_id="
+id_carpetas <- "d543a7b1-f8cb-439f-8a5c-e56c5479eeb5" #carpetas y viictimas de investigación en la CDMX:
+limite <- "&limit=32000" # Si no se especifica el número de observaciones se regresan 100 por default
+# limita las consultas de json a 32,000 observaciones por consulta la página de datos abiertos por el momento
+```
+Hacemos el request, para ello hacemos uso de fromJSON, ya que la API de CKAN contesta con archivos JSON, esta función le da estructura de lista para su manejo. 
+```{r consulta_2}
+req <- fromJSON(paste0(url,funcion,id_carpetas,limite))
+class(req) # el request es una lista, por lo que debemos buscar lo que pedimos dentro de la lista
+glimpse(req) # objetos de la lista con listas y objetos dentro de ellos
+req$success # el request fue exitoso
+```
+
+Habiendo revisado que la consulta fue exitosa, extraemos la información del requiest enviado:
+
+```{r consulta_3}
+#Extraemos los datos de la consulta
+datos_fgj <- req$result$records
+glimpse(datos_fgj) #Revisamos qué datos vienen
+total_records <- req$result$total #Vemos cuál es el total de los datos
+total_records
+```
+
+Como podemos apreciar, el número de datos de la base es menor al extraído, por lo que necesiutamos extraer la base secuencialmente hasta terminar de extraer el archivo, lo haremos con el siguiete loop:
+
+```{r consulta_4}
+while (nrow(datos_fgj)<total_records){
+  ofst <- nrow(datos_fgj)
+  ofset <- paste0("&offset=",ofst)
+  req_2 <- fromJSON(paste0(url,funcion,id_carpetas,limite,ofset))
+  datos_fgj <- rbind(datos_fgj,req_2$result$records)
+  print(nrow(datos_fgj))
+}
+#limpiamos espacio
+rm(url,funcion,id_carpetas,limite,ofset,ofst,req,req_2,total_records)
+glimpse(datos_fgj)
+```
+
+Ahora que tenemos la base de datos completa podemos elegir las variables que necesitamos y operar sobre ellas.
+
+### Datos de Interés.-
+
+Para el tutorial de hoy queremos únicamente la categoría del delito, el año del hecho y el sexo de la victima, aunque las demás variables pueden ser de amplio interés para otros análisis.
+
+```{r limpia_1}
+datos_fgj <- datos_fgj %>% tibble() %>%  dplyr::select(Categoria,Sexo,Ano_hecho,latitud,longitud) # elegimos lo que queremos 
+glimpse(datos_fgj)
+#Problema, necesitamos que las latitudes y longitudes sean numéricos:
+datos_fgj$latitud <- as.numeric(datos_fgj$latitud) #hago números las coordenadas
+datos_fgj$longitud <- as.numeric(datos_fgj$longitud) #números de las coordenadas
+sum(is.na(datos_fgj$latitud))
+sum(is.na(datos_fgj$longitud))
+datos_fgj <- datos_fgj[-which(is.na(datos_fgj$latitud)),] # quitamos los que no tienen latitud
+datos_fgj <- datos_fgj[-which(is.na(datos_fgj$longitud)),] # quitamos los que no tienen longitud
+```
+
+Vemos los puntos de latitud y longitud que extraímos:
+
+```{r grafica_1}
+ggplot(data = datos_fgj,aes(longitud,latitud)) +
+  geom_point(size=0.01) # datos normales
+```
+
+Para los subsecuentes análisis es importante ver la frecuencia temporal de las observaciones:
+
+```{r frecuencia_1}
+table(datos_fgj$Ano_hecho)
+plot(table(datos_fgj$Ano_hecho))
+```
+
+Vamos a restringir datos a los hechos entre 2019 - 2021, dado que es la fecha donde comienzan a capturarse estos datos en este formato:
+```{frecuencia_2}
+datos_fgj <- datos_fgj %>% filter(Ano_hecho > 2018) %>% filter(Ano_hecho!= "NA")
+plot(table(datos_fgj$Ano_hecho))
+```
+
+### Gráficas Estáticas.-
+Densidad de crimen por concentración de puntos:
+```{r grafica_2}
+ggplot(datos_fgj, aes(x = longitud, y = latitud)) + 
+  coord_equal() + 
+  xlab('Longitud') + 
+  ylab('Latitud') + 
+  labs(title="Densidad de crimen en la CDMX con datos entre 2019-2021")+
+  stat_density2d(aes(fill = ..level..), alpha = .5,
+                 h = .02, n = 300,
+                 geom = "polygon", data = datos_fgj) + 
+  scale_fill_viridis_c() 
+```
+
+Víctimas en carpetas por sexo:
+```{r grafica_3}
+ggplot(data = datos_fgj,aes(longitud,latitud)) +
+  geom_point(size=0.01,aes(colour=Sexo))+
+  labs(title="Carpetas de Investigación por Sexo de la Víctima en la CDMX entre 2016 - 2021",
+       caption = "Con información de la FGJ en Datos Abiertos: https://datos.cdmx.gob.mx/dataset/victimas-en-carpetas-de-investigacion-fgj")
+```
+Quitamos NA:
+```{r grafica_4}
+datos_sexo <- datos_fgj[!datos_fgj$Sexo=="NA",]
+nrow(datos_fgj)-nrow(datos_sexo) # Datos perdidos al quitar NA
+ggplot(data = datos_sexo,aes(longitud,latitud)) +
+  geom_point(size=0.01,aes(colour=Sexo)) + 
+  theme(legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid", colour ="darkblue")) +
+  labs(title="Carpetas de Investigación por Sexo de la Víctima en la CDMX entre 2016 - 2021",
+       caption = "Con información de la FGJ en Datos Abiertos: https://datos.cdmx.gob.mx/dataset/victimas-en-carpetas-de-investigacion-fgj")
+```
+Víctimas porCategoría del delito:
+
+```{r grafica_5}
+ggplot(data = datos_fgj,aes(longitud,latitud)) +
+  geom_point(size=0.01,aes(colour=Categoria)) + 
+  theme(legend.position = "bottom",
+        legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid", colour ="darkblue")) +
+  guides(colour=guide_legend(ncol=3))+
+  labs(title="Carpetas de Investigación por Categoría de Delito en la CDMX entre 2016 - 2021",
+       caption = "Con información de la FGJ en Datos Abiertos: https://datos.cdmx.gob.mx/dataset/victimas-en-carpetas-de-investigacion-fgj")
+```
+
+Dificil de interpretar, podemos seccionarlo, un mapa por cada categoría del delito ---
+```{r grafica_6}
+ggplot(data = datos_fgj,aes(longitud,latitud)) +
+  geom_point(size=0.01,aes(colour=Categoria)) + 
+  facet_wrap( ~ Categoria)+
+  theme(legend.position="none")+
+  labs(title="Carpetas de Investigación por Categoría de Delito en la CDMX entre 2016 - 2021",
+       caption = "Con información de la FGJ en Datos Abiertos: https://datos.cdmx.gob.mx/dataset/victimas-en-carpetas-de-investigacion-fgj")
+```
+
+### Intersectar Mapas-
+Clase de ambos objetos es distinta:
+```{r class_1}
+class(mapa_iecd)
+```
+
+Necesitamos hacer que los datos de latitud y longitud sean coordinadas:
+```{r spatial_1}
+#Extraemos los puntos y hacemos una matriz de ellos:
+puntos_fgj <- matrix(c(datos_fgj$longitud,datos_fgj$latitud),ncol = 2)
+puntos_fgj %>% head()
+```
+
+Ambos deben tener la misma predicción al convertir en objeto espacial
+Si revisamos el diccionario de datos encontrramos la projección utilizada por la FGJ: https://datos.cdmx.gob.mx/dataset/victimas-en-carpetas-de-investigacion-fgj   
+Podemos obtener el prj4 de internet: https://spatialreference.org/ref/epsg/wgs-84/
+
+```{r spatial_2}
+#forzamos a hacer espaciales
+puntos_fgj <- SpatialPoints(puntos_fgj,proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs"),bbox=NULL) 
+#proj4string se utiliza para obtener la proyección de un objeto espacial
+proj4string(mapa_iecd)
+#Traducimos al CRS (Coordinate Reference System) del mapa
+puntos_fgj <- spTransform(puntos_fgj,crs(mapa_iecd))
+puntos_fgj
+mapa_iecd
+# Ahora ambos son objetos espaciales en las mismas coordenadas y projecciones
+class(puntos_fgj) 
+class(mapa_iecd)
+st_crs(puntos_fgj)==st_crs(mapa_iecd)
+```
+
+Ahora veamos el mapa superpuesto:
+```{r mapa_1}
+plot(mapa_iecd, bg="lightblue", main="Delitos en la CDMX entre 2016-2020")
+points(puntos_fgj,pch=20,col="blue")
+```
+
+La diferencia principal entre los mapas de antes y ahora, es que ahora ambos objetos son espaciales: por lo que ahora podemos operar sobre ellos. Hacemos uso de la función over para revisar cuántos puntos hay sobre cada polígono.
+```{r over_1}
+over(mapa_iecd,puntos_fgj,returnList = FALSE, fn=sum) %>% head()
+#guardamos la variable
+mapa_iecd@data$delitos_totales <- over(mapa_iecd,puntos_fgj,returnList = FALSE, fn=sum)
+
+```
+
+### Leaflet.-
+
+Para poder visualizar estos datos de una manera agradable tornamos a leaflet; sin embargo debemos de cambiar de nuevo la proyección a la que este último software utiliza de manera default:
+
+```{r leaflet_1}
+class(mapa_iecd)
+
+mapa_iecd <- spTransform(mapa_iecd, "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+```
+Hacemos las divisiones con los deciles de delitos totales y con los mismos el color del mapa:
+
+```{r leaflet_2}
+bins <- quantile(mapa_iecd@data$delitos_totales,probs = seq(.1, 1, by = .1),na.rm=T)
+bins <- as.numeric(levels(factor(bins)))
+pal <- colorBin("YlOrRd", domain = mapa_iecd$delitos_totales, bins = bins)
+```
+
+```{r leaflet_3, eval=FALSE}
+m <- leaflet(mapa_iecd) %>%
+  addTiles()
+
+m %>% addPolygons(data=mapa_iecd, weight = .5,  fillColor = ~pal(delitos_totales), 
+              opacity = 1,
+              color = "black",
+              fillOpacity = 0.7,
+              label = labels,
+              labelOptions = labelOptions(
+                style = list("font-weight" = "normal", padding = "3px 8px"),
+                textsize = "15px",
+                direction = "auto"))
+
+labels <- sprintf(
+  "<strong>%s</strong><br/>%g Delitos totales entre 2019-2021",
+  mapa_iecd$NOMUT, mapa_iecd$delitos_totales) %>% lapply(htmltools::HTML)
+
+m
+```
+
+
+
